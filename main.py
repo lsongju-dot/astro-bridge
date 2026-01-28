@@ -150,8 +150,17 @@ def to_utc_jd(dt_local: datetime, tz_name: str) -> float:
 def calc_planet_positions(jd_ut: float) -> Dict[str, float]:
     positions: Dict[str, float] = {}
     for name, pid in PLANETS.items():
-        lon, _lat, _dist, _speed_lon = swe.calc_ut(jd_ut, pid)
-        positions[name] = float(lon)
+        res = swe.calc_ut(jd_ut, pid)
+
+        # pyswisseph 일반 반환: (xx, retflag)
+        if isinstance(res, tuple) and len(res) == 2:
+            xx, _retflag = res
+            lon = float(xx[0])  # ecliptic longitude
+        else:
+            # 혹시 다른 형태로 반환되는 환경 대비 (안전장치)
+            lon = float(res[0])
+
+        positions[name] = lon
     return positions
 
 
