@@ -10,13 +10,16 @@ from pydantic import BaseModel, Field
 import swisseph as swe
 
 
+# -----------------------
+# Config
+# -----------------------
 DEFAULT_TZ = "Asia/Seoul"
 DEFAULT_LAT = 37.5665
 DEFAULT_LON = 126.9780
 
 SIGNS = [
-    "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
-    "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
 ]
 
 PLANETS = {
@@ -37,6 +40,7 @@ ASPECTS = {
     "trine": 120,
     "opposite": 180,
 }
+
 DEFAULT_ORB = 6.0
 
 PRIORITY_PAIRS = {
@@ -47,21 +51,37 @@ PRIORITY_PAIRS = {
 }
 
 
-# ---------- Auth ----------
-def require_api_key(authorization: str | None):
+# -----------------------
+# Auth (PATCHED)
+# - Accept BOTH:
+#   1) x-api-key: <key>
+#   2) Authorization: Bearer <key>
+# -----------------------
+def require_api_key(authorization: str | None, x_api_key: str | None) -> None:
     expected = os.environ.get("ASTRO_BRIDGE_API_KEY")
     if not expected:
         raise HTTPException(status_code=500, detail="Server missing ASTRO_BRIDGE_API_KEY")
 
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    token: Optional[str] = None
 
-    token = authorization.replace("Bearer", "").strip()
+    # Prefer x-api-key if present
+    if x_api_key:
+        token = x_api_key.strip()
+
+    # Fallback to Authorization: Bearer <token>
+    elif authorization:
+        token = authorization.removeprefix("Bearer ").strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing API key")
+
     if token != expected:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-# ---------- Models ----------
+# -----------------------
+# Models
+# -----------------------
 class PersonIn(BaseModel):
     label: str = Field(default="A")
     birth_date: date
@@ -99,7 +119,9 @@ class SummaryResponse(BaseModel):
     json: Dict
 
 
-# ---------- Helpers ----------
+# -----------------------
+# Helpers
+# -----------------------
 def lon_to_sign(lon: float) -> Tuple[str, float]:
     lon = lon % 360.0
     sign_index = int(lon // 30)
@@ -111,17 +133,22 @@ def to_utc_jd(dt_local: datetime, tz_name: str) -> float:
     tzinfo = tz.gettz(tz_name)
     if tzinfo is None:
         raise ValueError(f"Unknown timezone: {tz_name}")
+
     if dt_local.tzinfo is None:
         dt_local = dt_local.replace(tzinfo=tzinfo)
+
     dt_utc = dt_local.astimezone(tz.UTC)
+
     return swe.julday(
-        dt_utc.year, dt_utc.month, dt_utc.day,
-        dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600
+        dt_utc.year,
+        dt_utc.month,
+        dt_utc.day,
+        dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600,
     )
 
 
 def calc_planet_positions(jd_ut: float) -> Dict[str, float]:
-    positions = {}
+    positions: Dict[str, float] = {}
     for name, pid in PLANETS.items():
         lon, _lat, _dist, _speed_lon = swe.calc_ut(jd_ut, pid)
         positions[name] = float(lon)
@@ -130,8 +157,8 @@ def calc_planet_positions(jd_ut: float) -> Dict[str, float]:
 
 def calc_ascendant(jd_ut: float, lat: float, lon: float) -> Optional[float]:
     try:
-        cusps, ascmc = swe.houses_ex(jd_ut, lat, lon, b'P')
-        return float(ascmc[0])
+        _cusps, ascmc = swe.houses_ex(jd_ut, lat, lon, b"P")
+        return float(ascmc[0])  # ASC
     except Exception:
         return None
 
@@ -142,11 +169,14 @@ def angle_diff(a: float, b: float) -> float:
 
 
 def compute_aspects(positions: Dict[str, float]) -> List[str]:
-    found = []
+    found: List[str] = []
     names = list(PLANETS.keys())
+
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             p1, p2 = names[i], names[j]
+
+            # MVP: only priority pairs
             if (p1, p2) not in PRIORITY_PAIRS and (p2, p1) not in PRIORITY_PAIRS:
                 continue
 
@@ -155,10 +185,12 @@ def compute_aspects(positions: Dict[str, float]) -> List[str]:
                 if abs(d - asp_deg) <= DEFAULT_ORB:
                     found.append(f"{p1} {asp_name} {p2}")
                     break
+
     return found
 
 
 def build_person_out(person: PersonIn, tz_name: str) -> PersonOut:
+    # If birth_time unknown, use noon; ASC will be unknown
     bt = person.birth_time
     dt_local = datetime.combine(person.birth_date, bt or time(12, 0, 0))
 
@@ -172,7 +204,7 @@ def build_person_out(person: PersonIn, tz_name: str) -> PersonOut:
 
     aspects = compute_aspects(pos)
 
-    asc = None
+    asc: Optional[Placement] = None
     if bt is not None:
         lat = person.lat if person.lat is not None else DEFAULT_LAT
         lon = person.lon if person.lon is not None else DEFAULT_LON
@@ -203,9 +235,10 @@ def format_text(person: PersonOut) -> str:
         return f"{pname}: {pl.sign} {pl.degree}°"
 
     parts = [fmt("Sun"), fmt("Moon"), fmt("Mercury"), fmt("Venus"), fmt("Mars"), fmt("Saturn")]
-    asc = "ASC: unknown" if person.asc is None else f"ASC: {person.asc.sign} {person.asc.degree}°"
-    aspects = " ; ".join(person.aspects) if person.aspects else "none"
-    return f"[{person.label}] " + ", ".join(parts) + f", {asc}\nAspects: {aspects}"
+    asc_txt = "ASC: unknown" if person.asc is None else f"ASC: {person.asc.sign} {person.asc.degree}°"
+    aspects_txt = " ; ".join(person.aspects) if person.aspects else "none"
+
+    return f"[{person.label}] " + ", ".join(parts) + f", {asc_txt}\nAspects: {aspects_txt}"
 
 
 def format_transit_text(transit: TransitOut) -> str:
@@ -216,6 +249,9 @@ def format_transit_text(transit: TransitOut) -> str:
     return f"[TransitToday {transit.date}] " + ", ".join(parts)
 
 
+# -----------------------
+# App
+# -----------------------
 app = FastAPI(title="Astro Bridge API", version="1.0.0")
 
 
@@ -225,8 +261,13 @@ def health():
 
 
 @app.post("/v1/astro/summary", response_model=SummaryResponse)
-def astro_summary(req: SummaryRequest, authorization: str | None = Header(default=None)):
-    require_api_key(authorization)
+def astro_summary(
+    req: SummaryRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+):
+    # ✅ AUTH CHECK (patched)
+    require_api_key(authorization, x_api_key)
 
     tz_name = req.timezone or DEFAULT_TZ
     basis_dt = req.basis_datetime or datetime.now(tz.gettz(tz_name))
