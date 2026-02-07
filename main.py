@@ -41,8 +41,10 @@ ASPECTS = {
     "opposite": 180,
 }
 
-DEFAULT_ORB = 6.0
+DEFAULT_ORB = 6.0  # natal aspects
+SYN_ORB = 5.0      # synastry aspects
 
+# natal priority aspects (MVP)
 PRIORITY_PAIRS = {
     ("Moon", "Saturn"),
     ("Venus", "Mars"),
@@ -50,9 +52,21 @@ PRIORITY_PAIRS = {
     ("Mercury", "Saturn"),
 }
 
+# synastry pairs (MVP)
+SYN_PAIRS = [
+    ("Venus", "Mars"),
+    ("Mars", "Venus"),
+    ("Moon", "Saturn"),
+    ("Saturn", "Moon"),
+    ("Mercury", "Saturn"),
+    ("Saturn", "Mercury"),
+    ("Sun", "Moon"),
+    ("Moon", "Sun"),
+]
+
 
 # -----------------------
-# Auth (PATCHED)
+# Auth
 # - Accept BOTH:
 #   1) x-api-key: <key>
 #   2) Authorization: Bearer <key>
@@ -92,7 +106,7 @@ class PersonIn(BaseModel):
 
 class SummaryRequest(BaseModel):
     personA: PersonIn
-    personB: PersonIn
+    personB: Optional[PersonIn] = None  # ✅ B는 선택
     basis_datetime: Optional[datetime] = None
     timezone: str = Field(default=DEFAULT_TZ)
 
@@ -122,6 +136,15 @@ class SummaryResponse(BaseModel):
 # -----------------------
 # Helpers
 # -----------------------
+def normalize_timezone(tz_name: str | None) -> str:
+    """If invalid timezone provided, fallback to Asia/Seoul."""
+    if not tz_name:
+        return DEFAULT_TZ
+    if tz.gettz(tz_name) is None:
+        return DEFAULT_TZ
+    return tz_name
+
+
 def lon_to_sign(lon: float) -> Tuple[str, float]:
     lon = lon % 360.0
     sign_index = int(lon // 30)
@@ -134,6 +157,7 @@ def to_utc_jd(dt_local: datetime, tz_name: str) -> float:
     if tzinfo is None:
         raise ValueError(f"Unknown timezone: {tz_name}")
 
+    # treat naive as local time in tz_name
     if dt_local.tzinfo is None:
         dt_local = dt_local.replace(tzinfo=tzinfo)
 
@@ -148,16 +172,20 @@ def to_utc_jd(dt_local: datetime, tz_name: str) -> float:
 
 
 def calc_planet_positions(jd_ut: float) -> Dict[str, float]:
+    """
+    pyswisseph swe.calc_ut typically returns (xx, retflag)
+    where xx[0] is ecliptic longitude.
+    """
     positions: Dict[str, float] = {}
     for name, pid in PLANETS.items():
         res = swe.calc_ut(jd_ut, pid)
 
-        # pyswisseph 일반 반환: (xx, retflag)
-        if isinstance(res, tuple) and len(res) == 2:
+        # common shape: (xx, retflag)
+        if isinstance(res, (tuple, list)) and len(res) == 2:
             xx, _retflag = res
-            lon = float(xx[0])  # ecliptic longitude
+            lon = float(xx[0])
         else:
-            # 혹시 다른 형태로 반환되는 환경 대비 (안전장치)
+            # fallback (rare)
             lon = float(res[0])
 
         positions[name] = lon
@@ -165,9 +193,19 @@ def calc_planet_positions(jd_ut: float) -> Dict[str, float]:
 
 
 def calc_ascendant(jd_ut: float, lat: float, lon: float) -> Optional[float]:
+    """
+    pyswisseph swe.houses_ex return shape differs by version.
+    We safely extract ascmc[0] (ASC). If anything fails, return None.
+    """
     try:
-        _cusps, ascmc = swe.houses_ex(jd_ut, lat, lon, b"P")
-        return float(ascmc[0])  # ASC
+        res = swe.houses_ex(jd_ut, lat, lon, b"P")
+
+        # typical: (cusps, ascmc) or (cusps, ascmc, ...)
+        if isinstance(res, (tuple, list)) and len(res) >= 2:
+            ascmc = res[1]
+            return float(ascmc[0])
+
+        return None
     except Exception:
         return None
 
@@ -178,6 +216,7 @@ def angle_diff(a: float, b: float) -> float:
 
 
 def compute_aspects(positions: Dict[str, float]) -> List[str]:
+    """MVP natal aspects within priority pairs only."""
     found: List[str] = []
     names = list(PLANETS.keys())
 
@@ -185,7 +224,6 @@ def compute_aspects(positions: Dict[str, float]) -> List[str]:
         for j in range(i + 1, len(names)):
             p1, p2 = names[i], names[j]
 
-            # MVP: only priority pairs
             if (p1, p2) not in PRIORITY_PAIRS and (p2, p1) not in PRIORITY_PAIRS:
                 continue
 
@@ -258,10 +296,33 @@ def format_transit_text(transit: TransitOut) -> str:
     return f"[TransitToday {transit.date}] " + ", ".join(parts)
 
 
+def placement_to_lon(p: Placement) -> float:
+    sign_index = SIGNS.index(p.sign)
+    return sign_index * 30.0 + float(p.degree)
+
+
+def compute_synastry(a: PersonOut, b: PersonOut) -> List[str]:
+    """
+    MVP synastry: check selected A-planet vs B-planet pairs.
+    Uses placements (rounded) so it's stable & fast.
+    """
+    a_lon = {k: placement_to_lon(v) for k, v in a.placements.items()}
+    b_lon = {k: placement_to_lon(v) for k, v in b.placements.items()}
+
+    found: List[str] = []
+    for pa, pb in SYN_PAIRS:
+        d = angle_diff(a_lon[pa], b_lon[pb])
+        for asp_name, asp_deg in ASPECTS.items():
+            if abs(d - asp_deg) <= SYN_ORB:
+                found.append(f"A {pa} {asp_name} B {pb}")
+                break
+    return found
+
+
 # -----------------------
 # App
 # -----------------------
-app = FastAPI(title="Astro Bridge API", version="1.0.0")
+app = FastAPI(title="Astro Bridge API", version="1.1.0")
 
 
 @app.get("/health")
@@ -275,24 +336,48 @@ def astro_summary(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ):
-    # ✅ AUTH CHECK (patched)
     require_api_key(authorization, x_api_key)
 
-    tz_name = req.timezone or DEFAULT_TZ
+    tz_name = normalize_timezone(req.timezone)
+
+    # basis_datetime: if omitted, server uses "now" in tz_name
     basis_dt = req.basis_datetime or datetime.now(tz.gettz(tz_name))
 
     a_out = build_person_out(req.personA, tz_name)
-    b_out = build_person_out(req.personB, tz_name)
     t_out = build_transit_out(basis_dt, tz_name)
 
-    text = "\n\n".join([format_text(a_out), format_text(b_out), format_transit_text(t_out)])
+    # ✅ SOLO mode (only A)
+    if req.personB is None:
+        text = "\n\n".join([format_text(a_out), format_transit_text(t_out)])
+        json_payload = {
+            "mode": "solo",
+            "personA": a_out.model_dump(),
+            "transitToday": t_out.model_dump(),
+            "basis": basis_dt.isoformat(),
+            "timezone": tz_name,
+        }
+        return SummaryResponse(text=text, json=json_payload)
+
+    # ✅ COUPLE mode (A + B + synastry)
+    b_out = build_person_out(req.personB, tz_name)
+    syn = compute_synastry(a_out, b_out)
+
+    syn_txt = " ; ".join(syn) if syn else "none"
+
+    text = "\n\n".join([
+        format_text(a_out),
+        format_text(b_out),
+        f"[Synastry] {syn_txt}",
+        format_transit_text(t_out),
+    ])
 
     json_payload = {
+        "mode": "couple",
         "personA": a_out.model_dump(),
         "personB": b_out.model_dump(),
+        "synastryAspects": syn,
         "transitToday": t_out.model_dump(),
         "basis": basis_dt.isoformat(),
         "timezone": tz_name,
     }
-
     return SummaryResponse(text=text, json=json_payload)
