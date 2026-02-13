@@ -381,3 +381,7 @@ def astro_summary(
         "timezone": tz_name,
     }
     return SummaryResponse(text=text, json=json_payload)
+
+from routers.saju import router as saju_router
+
+app.include_router(saju_router)
