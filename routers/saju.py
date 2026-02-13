@@ -458,3 +458,121 @@ def saju_calc(req: SajuRequest) -> Dict[str, Any]:
         }
 
     return out
+
+# =========================================================
+# Summary endpoints (GPT에 붙이기 좋은 짧은 출력)
+# =========================================================
+
+def _fmt_elements_line(elements_distribution):
+    # elements_distribution: [{"element":"목","count":1,"percent":12.5}, ...]
+    parts = []
+    parts_pct = []
+    for e in elements_distribution:
+        parts.append(f'{e["element"]}{e["count"]}')
+        parts_pct.append(f'{e["element"]}{e["percent"]}%')
+    return " / ".join(parts), " / ".join(parts_pct)
+
+def _fmt_tengods_line(ten_gods):
+    # ten_gods: {"year":{"stem":"정관","branch":"상관"}, ...}
+    def one(p):
+        return f'{p["stem"]}/{p["branch"]}'
+    return (
+        f'year {one(ten_gods["year"])}, '
+        f'month {one(ten_gods["month"])}, '
+        f'day {one(ten_gods["day"])}, '
+        f'hour {one(ten_gods["hour"])}'
+    )
+
+def _fmt_pillars_line(pillars):
+    # pillars: {"year":{"ganzhi":"戊寅"}, ...}
+    return f'year {pillars["year"]["ganzhi"]} | month {pillars["month"]["ganzhi"]} | day {pillars["day"]["ganzhi"]} | hour {pillars["hour"]["ganzhi"]}'
+
+def _fmt_day_master(pillars):
+    # day stem info
+    ds = pillars["day"]["stem"]["hanja"]
+    de = pillars["day"]["stem"]["element"]
+    yy = pillars["day"]["stem"]["yin_yang"]
+    return f'{ds}({de}/{yy})'
+
+def _fmt_yinyang_line(yin_yang_ratio):
+    yang = yin_yang_ratio["yang"]
+    yin = yin_yang_ratio["yin"]
+    return f'양 {yang["count"]}({yang["percent"]}%) / 음 {yin["count"]}({yin["percent"]}%)'
+
+def _fmt_luck_preview(luck):
+    # 너무 길어지지 않게 맛보기만
+    if not luck:
+        return None
+    daewoon = luck.get("daewoon") or []
+    preview = daewoon[:3]
+    preview_str = ", ".join([f'{x["ganzhi"]}({x["start_age"]}~{x["end_age"]})' for x in preview])
+    return (
+        f'direction={luck.get("direction")}, '
+        f'start_age={luck.get("start_age_years")}, '
+        f'daewoon_top3=[{preview_str}]'
+    )
+
+@router.post("/v1/saju/summary")
+def saju_summary(req: SajuRequest) -> Dict[str, Any]:
+    """
+    - /v1/saju/calc 결과를 기반으로
+    - GPT 프롬프트에 바로 붙이기 좋은 짧은 text + 압축 json을 반환
+    """
+    base = saju_calc(req)
+
+    pillars = base["pillars"]
+    ten_gods = base["ten_gods"]
+    elements_distribution = base["elements_distribution"]
+    yin_yang_ratio = base["yin_yang_ratio"]
+
+    elem_counts, elem_pcts = _fmt_elements_line(elements_distribution)
+    tg_line = _fmt_tengods_line(ten_gods)
+    pillars_line = _fmt_pillars_line(pillars)
+    day_master = _fmt_day_master(pillars)
+    yy_line = _fmt_yinyang_line(yin_yang_ratio)
+
+    luck_preview = _fmt_luck_preview(base.get("luck"))
+
+    # 텍스트는 "짧고 일정한 포맷" 고정
+    lines = [
+        "[SAJU_SUMMARY]",
+        f'name: {base["name"]} ({base["gender"]})',
+        f'birth_kst: {base["birth_datetime_kst"]}',
+        f'pillars: {pillars_line}',
+        f'day_master: {day_master}',
+        f'ten_gods: {tg_line}',
+        f'elements(8): {elem_counts}',
+        f'elements(%): {elem_pcts}',
+        f'yin_yang(8): {yy_line}',
+        "rules: 입춘(연) / 절기(월) / 자시23(시) / 지장간 미포함(오행8)",
+    ]
+    if base.get("assumptions", {}).get("use_solar_time_correction"):
+        lines.append("solar_time: ON (KST 135E 기준 경도보정)")
+    else:
+        lines.append("solar_time: OFF")
+
+    if luck_preview:
+        lines.append(f'luck: {luck_preview}')
+
+    text = "\n".join(lines)
+
+    # 압축 JSON (프롬프트/저장용)
+    compact_json = {
+        "name": base["name"],
+        "gender": base["gender"],
+        "birth_datetime_kst": base["birth_datetime_kst"],
+        "pillars": {
+            "year": pillars["year"]["ganzhi"],
+            "month": pillars["month"]["ganzhi"],
+            "day": pillars["day"]["ganzhi"],
+            "hour": pillars["hour"]["ganzhi"],
+        },
+        "day_master": pillars["day"]["stem"]["hanja"],
+        "ten_gods": ten_gods,
+        "elements_distribution": elements_distribution,
+        "yin_yang_ratio": yin_yang_ratio,
+        "luck": base.get("luck"),
+        "assumptions": base.get("assumptions"),
+    }
+
+    return {"text": text, "json": compact_json}
