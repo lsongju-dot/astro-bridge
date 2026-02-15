@@ -11,6 +11,12 @@ import swisseph as swe
 
 
 # -----------------------
+# App (IMPORTANT: must exist for uvicorn main:app)
+# -----------------------
+app = FastAPI(title="Astro Bridge API", version="1.2.0")
+
+
+# -----------------------
 # Config
 # -----------------------
 DEFAULT_TZ = "Asia/Seoul"
@@ -66,8 +72,8 @@ SYN_PAIRS = [
 
 HOUSE_SYSTEM = Literal["placidus", "whole"]
 HOUSE_SYSTEM_TO_CODE: Dict[str, bytes] = {
-    "placidus": b"P",
-    "whole": b"W",
+    "placidus": b"P",  # Placidus
+    "whole": b"W",     # Whole Sign (Swiss Ephemeris)
 }
 
 
@@ -83,7 +89,6 @@ def require_api_key(authorization: str | None, x_api_key: str | None) -> None:
         raise HTTPException(status_code=500, detail="Server missing ASTRO_BRIDGE_API_KEY")
 
     token: Optional[str] = None
-
     if x_api_key:
         token = x_api_key.strip()
     elif authorization:
@@ -109,10 +114,10 @@ class PersonIn(BaseModel):
 
 class SummaryRequest(BaseModel):
     personA: PersonIn
-    personB: Optional[PersonIn] = None  # B는 선택
+    personB: Optional[PersonIn] = None  # B는 선택(솔로/커플 자동)
     basis_datetime: Optional[datetime] = None
     timezone: str = Field(default=DEFAULT_TZ)
-    house_system: HOUSE_SYSTEM = Field(default="placidus")  # ✅ 추가
+    house_system: HOUSE_SYSTEM = Field(default="placidus")  # placidus / whole
 
 
 class Placement(BaseModel):
@@ -125,8 +130,8 @@ class PersonOut(BaseModel):
     placements: Dict[str, Placement]
     asc: Optional[Placement] = None
     aspects: List[str]
-    houses: Optional[Dict[str, int]] = None  # ✅ 추가: 행성별 하우스 번호
-    house_system: Optional[str] = None       # ✅ 추가
+    houses: Optional[Dict[str, int]] = None          # 행성별 하우스 번호(출생시간 있을 때)
+    house_system: Optional[str] = None               # 적용된 하우스 시스템
 
 
 class TransitOut(BaseModel):
@@ -176,23 +181,35 @@ def to_utc_jd(dt_local: datetime, tz_name: str) -> float:
 
 
 def calc_planet_positions(jd_ut: float) -> Dict[str, float]:
+    """
+    pyswisseph swe.calc_ut typically returns (xx, retflag)
+    where xx[0] is ecliptic longitude.
+    """
     positions: Dict[str, float] = {}
     for name, pid in PLANETS.items():
         res = swe.calc_ut(jd_ut, pid)
+
+        # common shape: (xx, retflag)
         if isinstance(res, (tuple, list)) and len(res) == 2:
             xx, _retflag = res
             lon = float(xx[0])
         else:
             lon = float(res[0])
+
         positions[name] = lon
     return positions
 
 
-def calc_cusps_and_angles(jd_ut: float, lat: float, lon: float, hsys: bytes) -> Tuple[Optional[List[float]], Optional[List[float]]]:
+def calc_cusps_and_angles(
+    jd_ut: float,
+    lat: float,
+    lon: float,
+    hsys: bytes
+) -> Tuple[Optional[List[float]], Optional[List[float]]]:
     """
     Returns (cusps, ascmc)
-    cusps: Swiss Ephemeris 스타일로 index 1..12 사용 (0은 비어있을 수 있음)
-    ascmc: ascmc[0] = ASC
+    - cusps: Swiss Ephemeris 스타일로 index 1..12 사용(길이 13일 수도/12일 수도)
+    - ascmc: ascmc[0] = ASC
     """
     try:
         res = swe.houses_ex(jd_ut, lat, lon, hsys)
@@ -211,6 +228,7 @@ def angle_diff(a: float, b: float) -> float:
 
 
 def compute_aspects(positions: Dict[str, float]) -> List[str]:
+    """MVP natal aspects within priority pairs only."""
     found: List[str] = []
     names = list(PLANETS.keys())
 
@@ -283,3 +301,184 @@ def build_houses_mapping(
     # Placidus(기본): cusp 구간에 따라 하우스 계산
     if not cusps_raw:
         return {}
+
+    cusps_u = unwrap_cusps(cusps_raw)
+    out: Dict[str, int] = {}
+    for pname, plon in planet_lons.items():
+        out[pname] = house_of_lon_quadrant(cusps_u, plon)
+    return out
+
+
+def build_person_out(person: PersonIn, tz_name: str, house_system: str) -> PersonOut:
+    # If birth_time unknown, use noon; ASC/house will be unknown
+    bt = person.birth_time
+    dt_local = datetime.combine(person.birth_date, bt or time(12, 0, 0))
+
+    jd_ut = to_utc_jd(dt_local, tz_name)
+    pos = calc_planet_positions(jd_ut)
+
+    placements: Dict[str, Placement] = {}
+    for pname, lon in pos.items():
+        sign, deg = lon_to_sign(lon)
+        placements[pname] = Placement(sign=sign, degree=round(deg, 2))
+
+    aspects = compute_aspects(pos)
+
+    asc: Optional[Placement] = None
+    houses: Optional[Dict[str, int]] = None
+
+    if bt is not None:
+        lat = person.lat if person.lat is not None else DEFAULT_LAT
+        lon = person.lon if person.lon is not None else DEFAULT_LON
+
+        hsys = HOUSE_SYSTEM_TO_CODE.get(house_system, b"P")
+        cusps_raw, ascmc = calc_cusps_and_angles(jd_ut, lat, lon, hsys)
+
+        # ASC
+        if ascmc and len(ascmc) > 0:
+            asc_lon = float(ascmc[0])
+            s, d = lon_to_sign(asc_lon)
+            asc = Placement(sign=s, degree=round(d, 2))
+
+            # houses mapping
+            houses = build_houses_mapping(house_system, asc_lon, pos, cusps_raw)
+
+    return PersonOut(
+        label=person.label,
+        placements=placements,
+        asc=asc,
+        aspects=aspects,
+        houses=houses,
+        house_system=house_system if bt is not None else None,
+    )
+
+
+def build_transit_out(basis_dt: datetime, tz_name: str) -> TransitOut:
+    jd_ut = to_utc_jd(basis_dt, tz_name)
+    pos = calc_planet_positions(jd_ut)
+
+    placements: Dict[str, Placement] = {}
+    for pname in TRANSIT_PLANETS:
+        lon = pos[pname]
+        s, d = lon_to_sign(lon)
+        placements[pname] = Placement(sign=s, degree=round(d, 2))
+
+    return TransitOut(date=basis_dt.date().isoformat(), placements=placements)
+
+
+def format_text(person: PersonOut) -> str:
+    def fmt(pname: str) -> str:
+        pl = person.placements[pname]
+        return f"{pname}: {pl.sign} {pl.degree}°"
+
+    parts = [fmt("Sun"), fmt("Moon"), fmt("Mercury"), fmt("Venus"), fmt("Mars"), fmt("Saturn")]
+    asc_txt = "ASC: unknown" if person.asc is None else f"ASC: {person.asc.sign} {person.asc.degree}°"
+    aspects_txt = " ; ".join(person.aspects) if person.aspects else "none"
+
+    hs_txt = ""
+    if person.houses:
+        hs_txt = " | Houses: " + ", ".join([f"{k}={v}" for k, v in person.houses.items()])
+        hs_txt += f" ({person.house_system})"
+
+    return f"[{person.label}] " + ", ".join(parts) + f", {asc_txt}\nAspects: {aspects_txt}{hs_txt}"
+
+
+def format_transit_text(transit: TransitOut) -> str:
+    parts = []
+    for pname in TRANSIT_PLANETS:
+        pl = transit.placements[pname]
+        parts.append(f"{pname}: {pl.sign} {pl.degree}°")
+    return f"[TransitToday {transit.date}] " + ", ".join(parts)
+
+
+def placement_to_lon(p: Placement) -> float:
+    sign_index = SIGNS.index(p.sign)
+    return sign_index * 30.0 + float(p.degree)
+
+
+def compute_synastry(a: PersonOut, b: PersonOut) -> List[str]:
+    """
+    MVP synastry: check selected A-planet vs B-planet pairs.
+    Uses placements (rounded) so it's stable & fast.
+    """
+    a_lon = {k: placement_to_lon(v) for k, v in a.placements.items()}
+    b_lon = {k: placement_to_lon(v) for k, v in b.placements.items()}
+
+    found: List[str] = []
+    for pa, pb in SYN_PAIRS:
+        d = angle_diff(a_lon[pa], b_lon[pb])
+        for asp_name, asp_deg in ASPECTS.items():
+            if abs(d - asp_deg) <= SYN_ORB:
+                found.append(f"A {pa} {asp_name} B {pb}")
+                break
+    return found
+
+
+# -----------------------
+# Routes
+# -----------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.post("/v1/astro/summary", response_model=SummaryResponse)
+def astro_summary(
+    req: SummaryRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+):
+    require_api_key(authorization, x_api_key)
+
+    tz_name = normalize_timezone(req.timezone)
+    house_system = req.house_system if req.house_system in ("placidus", "whole") else "placidus"
+
+    # basis_datetime: if omitted, server uses "now" in tz_name
+    basis_dt = req.basis_datetime or datetime.now(tz.gettz(tz_name))
+
+    a_out = build_person_out(req.personA, tz_name, house_system)
+    t_out = build_transit_out(basis_dt, tz_name)
+
+    # SOLO mode (only A)
+    if req.personB is None:
+        text = "\n\n".join([format_text(a_out), format_transit_text(t_out)])
+        json_payload = {
+            "mode": "solo",
+            "personA": a_out.model_dump(),
+            "transitToday": t_out.model_dump(),
+            "basis": basis_dt.isoformat(),
+            "timezone": tz_name,
+            "house_system": house_system,
+        }
+        return SummaryResponse(text=text, json=json_payload)
+
+    # COUPLE mode (A + B + synastry)
+    b_out = build_person_out(req.personB, tz_name, house_system)
+    syn = compute_synastry(a_out, b_out)
+    syn_txt = " ; ".join(syn) if syn else "none"
+
+    text = "\n\n".join([
+        format_text(a_out),
+        format_text(b_out),
+        f"[Synastry] {syn_txt}",
+        format_transit_text(t_out),
+    ])
+
+    json_payload = {
+        "mode": "couple",
+        "personA": a_out.model_dump(),
+        "personB": b_out.model_dump(),
+        "synastryAspects": syn,
+        "transitToday": t_out.model_dump(),
+        "basis": basis_dt.isoformat(),
+        "timezone": tz_name,
+        "house_system": house_system,
+    }
+    return SummaryResponse(text=text, json=json_payload)
+
+
+# -----------------------
+# Include SAJU router
+# -----------------------
+from routers.saju import router as saju_router
+app.include_router(saju_router)
