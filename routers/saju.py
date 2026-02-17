@@ -74,25 +74,43 @@ BRANCH_TO_MONTH_INDEX = {b:i for i,b in enumerate(MONTH_BRANCHES)}
 # =========================================================
 class SajuRequest(BaseModel):
     name: str = Field(..., example="송주")
-    gender: Literal["male","female"] = Field(..., example="female")
-    birth_datetime: str = Field(..., description="KST 기준 'YYYY-MM-DD HH:MM'", example="1998-07-15 19:10")
+    gender: Literal["male", "female"] = Field(..., example="female")
 
+    # ✅ 호환: birth_datetime / birth_datetime_kst 둘 다 받음
+    # - "1998-07-15 19:10"
+    # - "1998-07-15T19:10:00+09:00"
+    birth_datetime: str = Field(
+        ...,
+        validation_alias=AliasChoices("birth_datetime", "birth_datetime_kst"),
+        description="KST 기준 'YYYY-MM-DD HH:MM' 또는 ISO8601('1998-07-15T19:10:00+09:00')",
+        example="1998-07-15 19:10",
+    )
+
+    # ✅ 호환: lat/lon 플랫도 받고, location 객체도 받음
     lat: Optional[float] = Field(None, example=37.5665)
     lon: Optional[float] = Field(None, example=126.9780)
+    location: Optional[Dict[str, float]] = Field(
+        default=None,
+        description="대안 입력: {'lat': 37.56, 'lon': 126.97}",
+        example={"lat": 37.5665, "lon": 126.9780},
+    )
 
-    # 시간 모름 처리(정오 가정) + 표시용
     birth_time_unknown: bool = Field(False, example=False)
-
-    # 자시 시작은 기본 고정(23:00), 태양시(경도 보정) 적용은 기본 True
     use_solar_time_correction: bool = Field(True, example=True)
-
-    # 느릴 수 있는 luck 계산(대운/세운/월운) — 필요할 때만 true 권장
     include_luck: bool = Field(False, example=False)
-
-    # 세운/월운 기준 연도 (없으면 올해)
     target_year: Optional[int] = Field(None, example=2026)
-
     include_debug: bool = Field(False, example=False)
+
+    # ✅ location이 있으면 lat/lon 자동 채우기
+    @model_validator(mode="after")
+    def _fill_location(self):
+        if self.location:
+            if self.lat is None and "lat" in self.location:
+                self.lat = float(self.location["lat"])
+            if self.lon is None and "lon" in self.location:
+                self.lon = float(self.location["lon"])
+        return self
+
 
 # =========================================================
 # Swiss Ephemeris helpers
