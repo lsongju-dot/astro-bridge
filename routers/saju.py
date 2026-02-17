@@ -6,7 +6,7 @@ from typing import Any, Dict, Literal, Optional
 
 import swisseph as swe
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices, model_validator
 from zoneinfo import ZoneInfo
 
 router = APIRouter(tags=["saju"])
